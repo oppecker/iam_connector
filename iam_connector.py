@@ -1,103 +1,93 @@
 import boto3
-import uuid
-import json
+import botocore
 from boto3.dynamodb.conditions import Key
+from expiire.aws.cloud_user_manager import CloudUserManager
 
 def lambda_handler(event, context):
-    connector = IAM_CONNECTOR(
-        db_name='dynamodb',
-        table_name='CIAM_DEMO',
-        company_id=event['company'],
-        account_id=event['account'],
-        account_number=event['account_number'],
-    )
-    user_names = connector.main()
-
-    return {
-        'statusCode': 200,
-        'body': json.dumps(user_names)
+    profiles = get_all_account_profiles(db_name='dynamodb', table_name='expiire')
+    for profile in [profile for profile in profiles]:
+        try:
+            connector = IAM_CONNECTOR(
+                db_name='dynamodb',
+                table_name='expiire',
+                company_id=profile['company_id'],
+                account_id=profile['account_id'],
+                account_number=profile['account_number'],
+                role_arn=profile['iam_arn'],
+            )
+            user_names = [name for name in connector.main()]
+        
+        except botocore.exceptions.ClientError as error:
+            print(f"Error with client for profile: {profile}")
+        
+        except botocore.exceptions.ParamValidationError as error:
+            print(f"Error with parameters for profile: {profile}")
+            
+    
+def get_all_account_profiles(db_name, table_name):
+    dynamodb = boto3.resource(db_name)
+    table = dynamodb.Table(table_name)
+    scan_kwargs = {
+        'FilterExpression': Key('PK').begins_with('Company#') & Key('SK').begins_with('#AccountProfile#')
     }
-
+    response = table.scan(**scan_kwargs)
+    profiles = response['Items']
+    while 'LastEvaluatedKey' in response:
+        response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'], **scan_kwargs)
+        profiles.extend(response['Items'])
+        
+    for profile in profiles:
+        yield {
+            'iam_arn': profile['iam_arn'],
+            'company_id': profile['company_id'],
+            'account_id': profile['account_id'],
+            'account_number': profile['account_number'],
+        }
+    
 class IAM_CONNECTOR():
-    def __init__(self, db_name, table_name, company_id, account_id, account_number):
-        # Step 1: Get Credentials From DB
+    def __init__(self, db_name, table_name, company_id, account_id, account_number, role_arn):
         dynamodb = boto3.resource(db_name)
         self.table = dynamodb.Table(table_name)
-
+        
         self.company_id = company_id
         self.account_id = account_id
         self.account_number = account_number
-
-        self.client = None
-
-    def get_creds(self, primary_value, sort_value):
-        response = self.table.get_item(Key={'PK': primary_value, 'SK': sort_value})
-        return {
-            'access_key_id': response['Item']['AccessKeyId'],
-            'access_key_secret': response['Item']['AccessKeySecret'],
-        }
-
-    def create_iam_client(self, primary_value, sort_value):
-        # Step 1: Get Credentials From DB
-        creds = self.get_creds(
-            primary_value=primary_value,
-            sort_value=sort_value,
+        
+        self.client = self.create_boto3_client(role_arn)
+        self.cloud_user_manager = CloudUserManager()
+        
+    def create_boto3_client(self, role_arn):
+        sts_connection = boto3.client('sts')
+        acct_b = sts_connection.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="cross_acct_lambda"
         )
-
-        # Step 2: Create Session and Client
-        session = boto3.Session(
-            aws_access_key_id=creds['access_key_id'],
-            aws_secret_access_key=creds['access_key_secret'],
+    
+        return boto3.client(
+            'iam',
+            aws_access_key_id=acct_b['Credentials']['AccessKeyId'],
+            aws_secret_access_key=acct_b['Credentials']['SecretAccessKey'],
+            aws_session_token=acct_b['Credentials']['SessionToken'],
         )
-        self.client = session.client('iam')
 
     def main(self):
-        self.create_iam_client(
-            primary_value=f"CLOUD#AWS{self.account_number}",
-            sort_value=f"#PROFILE#AWS{self.account_number}",
-        )
-
         # Step 1: Get List of Users
         response = self.client.list_users()
-        print(response)
 
         # Step 2: Add Users to Table If they Don't Exist
-        user_names = [user['UserName'] for user in response['Users']]
-        for user in user_names:
-            result = self.check_if_user_exists(
-                name = user,
-                company_id = self.company_id,
-                account_id = self.account_id,
-            )
-            if result:
-                print(result)
+        for user in [user['UserName'] for user in response['Users']]:
+            if not self.cloud_user_manager.check_if_user_exists(
+                name=user,
+                company_id=self.company_id,
+                account_id=self.account_id,
+            ):
+                print(f"creating user: {user}")
+                self.cloud_user_manager.new_user(
+                    company_id = self.company_id,
+                    account_id = self.account_id,
+                    name = user,
+                    account_number = self.account_number,
+                )
             else:
-                create_user(name=user, account_id=self.account_id, company_id=self.company_id)
-
-        # Step 3: Return User Names
-        return user_names
-
-    def check_if_user_exists(self, name, company_id, account_id):
-        current_users = self.get_users_per_account(company_id=company_id, account_id=account_id)
-        for user in current_users:
-            if name == user['name']:
-                return user['user_id']
-        return False
-
-    def get_users_per_account(self, company_id, account_id):
-        PK = f"Company#{company_id}"
-        SK_Prefix = f"#CloudAcct#{account_id}#CloudUser#"
-        response = self.table.query(KeyConditionExpression=Key('PK').eq(PK) & Key('SK').begins_with(SK_Prefix))
-        return response['Items']
-
-    def create_user(self, name, account_id, company_id):
-        user_id = str(uuid.uuid4())
-        item = {
-            'name' : name,
-            'user_id' : user_id,
-            'account_id' : account_id,
-        }
-        item['PK'] = f"Company#{company_id}"
-        item['SK'] = f"#CloudAcct#{account_id}#CloudUser#{user_id}"
-        self.table.put_item(Item=item)
-        return user_id
+                print(f"user already exists: {user}")
+            yield user
